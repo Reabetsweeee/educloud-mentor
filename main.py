@@ -1,5 +1,5 @@
 import os
-from typing import List
+from typing import List, Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,23 +11,40 @@ from app.database import Base, engine, SessionLocal
 from app import models, schemas
 from app.auth import hash_password, verify_password, create_access_token
 
+# =========================
+# Config
+# =========================
 SECRET_KEY = os.getenv("SECRET_KEY", "change-me")
 ALGORITHM = "HS256"
 
+# Put your Netlify domain here once you have it, e.g. "https://educloud-mentor.netlify.app"
+ALLOWED_ORIGINS = [
+    "http://127.0.0.1:8000",
+    "http://localhost:8000",
+    "http://127.0.0.1:5500",
+    "http://localhost:5500",
+    # "https://YOUR-SITE.netlify.app",
+]
+
 app = FastAPI(title="EduCloud Mentor API")
 
-# CORS so your frontend can call the API
+# CORS (so your public website can call your API)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # later restrict to your deployed frontend domain
+    allow_origins=["*"],  # quick for now; restrict to ALLOWED_ORIGINS later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Create DB tables (simple MVP)
-Base.metadata.create_all(bind=engine)
+# Create tables safely on startup (Railway-friendly)
+@app.on_event("startup")
+def on_startup():
+    Base.metadata.create_all(bind=engine)
 
+# =========================
+# DB dependency
+# =========================
 def get_db():
     db = SessionLocal()
     try:
@@ -35,8 +52,12 @@ def get_db():
     finally:
         db.close()
 
-def decode_user_from_token(token: str) -> dict:
-    return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+# =========================
+# Auth helpers
+# =========================
+def require_role(user: models.User, allowed: List[str]):
+    if user.role not in allowed:
+        raise HTTPException(status_code=403, detail="Not allowed")
 
 def get_current_user(
     authorization: str = Header(None),
@@ -47,7 +68,7 @@ def get_current_user(
 
     token = authorization.split(" ", 1)[1]
     try:
-        payload = decode_user_from_token(token)
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id = payload.get("user_id")
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token payload")
@@ -59,21 +80,27 @@ def get_current_user(
         raise HTTPException(status_code=401, detail="User not found")
     return user
 
-def require_role(user: models.User, allowed: List[str]):
-    if user.role not in allowed:
-        raise HTTPException(status_code=403, detail="Not allowed")
-
+# =========================
+# Health
+# =========================
 @app.get("/")
 def root():
     return {"message": "EduCloud Mentor API is running"}
 
-# ---------- AUTH ----------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+# =========================
+# Auth endpoints
+# =========================
 @app.post("/auth/register")
 def register(payload: schemas.RegisterIn, db: Session = Depends(get_db)):
     if payload.role not in ["student", "mentor", "admin"]:
         raise HTTPException(status_code=400, detail="role must be student, mentor, or admin")
 
-    if db.query(models.User).filter(models.User.email == payload.email).first():
+    existing = db.query(models.User).filter(models.User.email == payload.email).first()
+    if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
 
     user = models.User(
@@ -96,7 +123,48 @@ def login(payload: schemas.LoginIn, db: Session = Depends(get_db)):
     token = create_access_token({"user_id": user.id, "role": user.role})
     return {"access_token": token, "token_type": "bearer", "role": user.role}
 
-# ---------- STUDENT ----------
+# =========================
+# Public student submission (no login)
+# For your Netlify student form
+# =========================
+@app.post("/public/requests")
+def public_create_request(payload: dict, db: Session = Depends(get_db)):
+    """
+    Accepts the simple payload from your public form:
+    {
+      "student_name": "...",
+      "subject": "...",
+      "description": "...",
+      "status": "Pending"
+    }
+    """
+    student_name = (payload.get("student_name") or "").strip()
+    subject = (payload.get("subject") or "").strip()
+    description = (payload.get("description") or "").strip()
+
+    if not student_name or not subject or not description:
+        raise HTTPException(status_code=400, detail="student_name, subject, and description are required")
+
+    # If your DB schema doesn't have student_name column, we store it in mentor_notes for now.
+    # Recommended: add a student_name column later.
+    req = models.MentorshipRequest(
+        student_id=1,  # placeholder (we’ll improve this later)
+        subject=subject,
+        topic="General",
+        urgency="Medium",
+        description=description,
+        status="Pending",
+        mentor_notes=f"Submitted by: {student_name}",
+    )
+
+    db.add(req)
+    db.commit()
+    db.refresh(req)
+    return {"message": "Request submitted", "request_id": req.id}
+
+# =========================
+# Student (logged in)
+# =========================
 @app.post("/requests", response_model=schemas.RequestOut)
 def create_request(
     payload: schemas.RequestCreate,
@@ -131,7 +199,9 @@ def my_requests(
         .all()
     )
 
-# ---------- MENTOR ----------
+# =========================
+# Mentor/Admin
+# =========================
 @app.get("/requests", response_model=List[schemas.RequestOut])
 def all_requests(
     db: Session = Depends(get_db),
@@ -159,7 +229,9 @@ def update_request(
     db.refresh(req)
     return req
 
-# ---------- ADMIN ----------
+# =========================
+# Admin metrics
+# =========================
 @app.get("/admin/metrics")
 def admin_metrics(
     db: Session = Depends(get_db),
